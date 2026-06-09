@@ -1,4 +1,10 @@
-from app.models.schemas import Product, ProductAnalysis, ShoppingReport
+from app.models.schemas import (
+    Product,
+    ProductAnalysis,
+    SearchCallTrace,
+    ShoppingReport,
+    StepAttemptTrace,
+)
 from app.services.task_manager import RedisTaskStore
 
 
@@ -68,7 +74,32 @@ def test_redis_task_store_persists_task_status_and_trace():
 
     task_id = store.create_task()
     event_id = store.start_step(task_id, "candidate", "候选产品抽取", 5, "候选产品抽取开始执行")
-    store.finish_step(task_id, event_id, "success", "候选产品抽取完成", 20)
+    attempts = [
+        StepAttemptTrace(
+            attempt=1,
+            status="success",
+            duration_ms=120,
+            tool_call_count=1,
+            model_duration_ms=40,
+            search_calls=[
+                SearchCallTrace(
+                    query="手机 主流型号",
+                    status="success",
+                    duration_ms=80,
+                    result_chars=500,
+                )
+            ],
+        )
+    ]
+    store.finish_step(
+        task_id,
+        event_id,
+        "success",
+        "候选产品抽取完成",
+        20,
+        attempts=attempts,
+        tool_call_count=1,
+    )
     store.complete_task(task_id, _build_report())
 
     task = store.get_task(task_id)
@@ -80,4 +111,7 @@ def test_redis_task_store_persists_task_status_and_trace():
     assert task.trace[0].step_key == "candidate"
     assert task.trace[0].status == "success"
     assert task.trace[0].duration_ms is not None
+    assert task.trace[0].attempt_count == 1
+    assert task.trace[0].tool_call_count == 1
+    assert task.trace[0].attempts[0].search_calls[0].query == "手机 主流型号"
     assert client.expirations[f"shopping:task:{task_id}"] == 60

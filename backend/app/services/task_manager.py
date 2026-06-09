@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Dict, Optional, Protocol
+from typing import Dict, List, Optional, Protocol
 from uuid import uuid4
 
-from ..models.schemas import ShoppingAnalysisTaskStatus, ShoppingReport, TaskTraceEvent
+from ..models.schemas import (
+    ShoppingAnalysisTaskStatus,
+    ShoppingReport,
+    StepAttemptTrace,
+    TaskTraceEvent,
+)
 from ..config import get_settings
 
 try:
@@ -46,6 +51,8 @@ class TaskStore(Protocol):
         progress: int,
         error_type: Optional[str] = None,
         error_message: Optional[str] = None,
+        attempts: Optional[List[StepAttemptTrace]] = None,
+        tool_call_count: int = 0,
     ):
         ...
 
@@ -129,6 +136,8 @@ class InMemoryTaskStore:
         progress: int,
         error_type: Optional[str] = None,
         error_message: Optional[str] = None,
+        attempts: Optional[List[StepAttemptTrace]] = None,
+        tool_call_count: int = 0,
     ):
         now = _now()
         with self._lock:
@@ -138,6 +147,9 @@ class InMemoryTaskStore:
             event.message = message
             event.ended_at = now
             event.duration_ms = int((now - event.started_at).total_seconds() * 1000)
+            event.attempts = attempts or []
+            event.attempt_count = len(event.attempts)
+            event.tool_call_count = tool_call_count
             event.error_type = error_type
             event.error_message = error_message
             task.progress = max(task.progress, min(progress, 99))
@@ -263,6 +275,8 @@ class RedisTaskStore:
         progress: int,
         error_type: Optional[str] = None,
         error_message: Optional[str] = None,
+        attempts: Optional[List[StepAttemptTrace]] = None,
+        tool_call_count: int = 0,
     ):
         now = _now()
         with self._task_lock(task_id):
@@ -272,6 +286,9 @@ class RedisTaskStore:
             event.message = message
             event.ended_at = now
             event.duration_ms = int((now - event.started_at).total_seconds() * 1000)
+            event.attempts = attempts or []
+            event.attempt_count = len(event.attempts)
+            event.tool_call_count = tool_call_count
             event.error_type = error_type
             event.error_message = error_message
             task.progress = max(task.progress, min(progress, 99))
@@ -385,6 +402,8 @@ class TaskTracer:
         message: str,
         error: Optional[Exception] = None,
         partial: bool = False,
+        attempts: Optional[List[StepAttemptTrace]] = None,
+        tool_call_count: int = 0,
     ):
         status = "success" if ok and not partial else "partial" if partial else "failed"
         if status != "success":
@@ -399,6 +418,8 @@ class TaskTracer:
             progress=self._end_progress.get(step_key, 90),
             error_type=type(error).__name__ if error else None,
             error_message=str(error) if error else None,
+            attempts=attempts,
+            tool_call_count=tool_call_count,
         )
 
     def final_status(self) -> str:

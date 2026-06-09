@@ -78,6 +78,7 @@ def evaluate_report(report: ShoppingReport, case: Dict[str, Any]) -> Dict[str, A
         _check_budget_awareness(report, request),
         _check_term_coverage("must_mention_terms", text, expected.get("must_mention_terms", []), min_ratio=0.6),
         _check_term_coverage("risk_terms", text, expected.get("risk_terms", []), min_ratio=0.5),
+        _check_citation_integrity(report),
         _check_forbidden_phrases(text),
     ]
     score = round(sum(check.score for check in checks) / len(checks), 4)
@@ -85,7 +86,11 @@ def evaluate_report(report: ShoppingReport, case: Dict[str, Any]) -> Dict[str, A
         "case_id": case["id"],
         "case_name": case["name"],
         "score": score,
-        "passed": score >= 0.75 and all(check.passed for check in checks if check.name in {"core_sections", "forbidden_phrases"}),
+        "passed": score >= 0.75 and all(
+            check.passed
+            for check in checks
+            if check.name in {"core_sections", "citation_integrity", "forbidden_phrases"}
+        ),
         "checks": [check.__dict__ for check in checks],
     }
 
@@ -228,6 +233,46 @@ def _check_forbidden_phrases(text: str) -> EvalCheck:
         passed=passed,
         score=1.0 if passed else 0.0,
         reason="未命中禁用表达" if passed else f"matched={matched}",
+    )
+
+
+def _check_citation_integrity(report: ShoppingReport) -> EvalCheck:
+    evidence_ids = {item.evidence_id for item in report.evidence}
+    referenced_ids = set(report.comparison_evidence_ids)
+    referenced_ids.update(report.recommendation_evidence_ids)
+    referenced_ids.update(report.budget_evidence_ids)
+    for analysis in report.products:
+        referenced_ids.update(analysis.product.price_evidence_ids)
+        referenced_ids.update(analysis.product.spec_evidence_ids)
+        referenced_ids.update(analysis.verdict_evidence_ids)
+        for review in analysis.reviews:
+            referenced_ids.update(review.evidence_ids)
+        for citation_map in [
+            analysis.pro_evidence_ids,
+            analysis.con_evidence_ids,
+            analysis.red_flag_evidence_ids,
+            analysis.controversy_evidence_ids,
+        ]:
+            for ids in citation_map.values():
+                referenced_ids.update(ids)
+
+    missing_ids = sorted(referenced_ids - evidence_ids)
+    passed = bool(evidence_ids) and bool(referenced_ids) and not missing_ids
+    if missing_ids:
+        score = max(0.0, 1.0 - len(missing_ids) / max(len(referenced_ids), 1))
+    elif not evidence_ids or not referenced_ids:
+        score = 0.0
+    else:
+        score = 1.0
+    return EvalCheck(
+        name="citation_integrity",
+        passed=passed,
+        score=round(score, 4),
+        reason=(
+            f"evidence={len(evidence_ids)}, referenced={len(referenced_ids)}"
+            if passed
+            else f"missing_ids={missing_ids}, evidence={len(evidence_ids)}, referenced={len(referenced_ids)}"
+        ),
     )
 
 

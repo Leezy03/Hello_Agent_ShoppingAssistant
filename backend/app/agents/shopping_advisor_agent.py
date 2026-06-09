@@ -2,14 +2,16 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 import shutil
 import sys
+import time
 from typing import Dict, Any, List, Optional, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
 from ..services.llm_service import get_llm, get_llm_config
@@ -20,6 +22,10 @@ from ..models.schemas import (
     Product,
     CandidateProduct,
     CandidateExtractionResult,
+    EvidenceItem,
+    EvidenceCollectionResult,
+    SearchCallTrace,
+    StepAttemptTrace,
 )
 from ..config import get_settings
 
@@ -28,8 +34,16 @@ from ..config import get_settings
 SEARCH_TOOL_NAME = "search_brave_web_search"
 DEFAULT_TOOL_TIMEOUT_SECONDS = 90
 DEFAULT_LLM_TIMEOUT_SECONDS = 90
-DEFAULT_TOOL_RETRIES = 2
+DEFAULT_TOOL_RETRIES = 1
 DEFAULT_LLM_RETRIES = 1
+SEARCH_CALL_TIMEOUT_SECONDS = 25
+SEARCH_MAX_CONCURRENCY = 3
+MAX_SEARCH_RESULT_CHARS = 4500
+EVIDENCE_LIMITS = {
+    "review": 3,
+    "price": 2,
+    "risk": 3,
+}
 
 
 class ShoppingAdvisorState(TypedDict, total=False):
@@ -43,6 +57,9 @@ class ShoppingAdvisorState(TypedDict, total=False):
     review_step: "StepResult"
     price_step: "StepResult"
     red_flag_step: "StepResult"
+    review_evidence: List[EvidenceItem]
+    price_evidence: List[EvidenceItem]
+    red_flag_evidence: List[EvidenceItem]
     review_response: str
     price_response: str
     red_flag_response: str
@@ -53,12 +70,54 @@ class ShoppingAdvisorError(Exception):
     """购物顾问基类异常"""
 
 
+@dataclass
+class AgentRunMetrics:
+    """一次检索 Agent 执行产生的可观测指标。"""
+
+    search_calls: List[SearchCallTrace] = field(default_factory=list)
+    model_duration_ms: Optional[int] = None
+
+    @property
+    def tool_call_count(self) -> int:
+        return len(self.search_calls)
+
+
+@dataclass
+class AgentRunResult:
+    """Agent 输出及其运行指标。"""
+
+    response: str
+    metrics: AgentRunMetrics = field(default_factory=AgentRunMetrics)
+
+
+class SearchPipelineTimeoutError(TimeoutError):
+    """异步检索流水线整体超时。"""
+
+    def __init__(self, timeout_seconds: int, metrics: AgentRunMetrics):
+        super().__init__(f"异步检索流水线超过{timeout_seconds}秒未完成")
+        self.metrics = metrics
+
+
+class SearchPipelineExecutionError(RuntimeError):
+    """检索流水线失败,同时保留已经产生的调用指标。"""
+
+    def __init__(self, message: str, metrics: AgentRunMetrics):
+        super().__init__(message)
+        self.metrics = metrics
+
+
 class StepExecutionError(ShoppingAdvisorError):
     """步骤执行异常"""
 
-    def __init__(self, step_name: str, message: str):
+    def __init__(
+        self,
+        step_name: str,
+        message: str,
+        metrics: Optional[AgentRunMetrics] = None,
+    ):
         super().__init__(message)
         self.step_name = step_name
+        self.metrics = metrics or AgentRunMetrics()
 
 
 class ToolExecutionError(StepExecutionError):
@@ -81,6 +140,14 @@ class JsonRepairError(ShoppingAdvisorError):
     """JSON 修复失败"""
 
 
+class CitationValidationError(ShoppingAdvisorError):
+    """报告引用与上游证据不一致"""
+
+    def __init__(self, issues: List[str]):
+        self.issues = issues
+        super().__init__("；".join(issues))
+
+
 @dataclass
 class StepResult:
     """步骤执行结果"""
@@ -89,6 +156,8 @@ class StepResult:
     ok: bool
     response: str = ""
     error: Optional[Exception] = None
+    attempts: List[StepAttemptTrace] = field(default_factory=list)
+    tool_call_count: int = 0
 
     @property
     def status_text(self) -> str:
@@ -104,11 +173,19 @@ class StepResult:
 class LangGraphAgent:
     """Small runtime wrapper for one role-specific LangGraph/LangChain agent."""
 
-    def __init__(self, name: str, llm: Any, system_prompt: str, uses_search: bool = False):
+    def __init__(
+        self,
+        name: str,
+        llm: Any,
+        system_prompt: str,
+        uses_search: bool = False,
+        search_kind: str = "generic",
+    ):
         self.name = name
         self.llm = llm
         self.system_prompt = system_prompt
         self.uses_search = uses_search
+        self.search_kind = search_kind
 
     def list_tools(self) -> List[str]:
         return [SEARCH_TOOL_NAME] if self.uses_search else []
@@ -126,13 +203,39 @@ class LangGraphAgent:
         return self._message_to_text(response)
 
     def _run_search_agent(self, query: str) -> str:
-        return asyncio.run(self._arun_search_agent(query))
+        return self.run_with_timeout(query, DEFAULT_TOOL_TIMEOUT_SECONDS).response
 
-    async def _arun_search_agent(self, query: str) -> str:
+    def run_with_timeout(self, query: str, timeout_seconds: int) -> AgentRunResult:
+        """在独立事件循环中运行可取消的异步检索流水线。"""
+        metrics = AgentRunMetrics()
+        started_at = time.perf_counter()
+        try:
+            return asyncio.run(
+                asyncio.wait_for(
+                    self._arun_search_agent(query, metrics),
+                    timeout=timeout_seconds,
+                )
+            )
+        except TimeoutError as exc:
+            raise SearchPipelineTimeoutError(timeout_seconds, metrics) from exc
+        except BaseExceptionGroup as exc:
+            elapsed = time.perf_counter() - started_at
+            deadline_tolerance = min(0.01, timeout_seconds)
+            if elapsed >= timeout_seconds - deadline_tolerance:
+                raise SearchPipelineTimeoutError(timeout_seconds, metrics) from exc
+            raise
+
+    async def _arun_search_agent(
+        self,
+        query: str,
+        metrics: Optional[AgentRunMetrics] = None,
+    ) -> AgentRunResult:
+        metrics = metrics or AgentRunMetrics()
         settings = get_settings()
         if not settings.search_api_key:
             raise RuntimeError("SEARCH_API_KEY 未配置,无法启动 Brave Search MCP Server")
 
+        search_queries = self._plan_search_queries(query)
         client = MultiServerMCPClient(
             {
                 "brave_search": {
@@ -143,113 +246,298 @@ class LangGraphAgent:
                 }
             }
         )
-        search_tool = self._find_brave_search_tool(await client.get_tools())
-        return await self._run_mcp_tool_loop(search_tool, query)
+        async with client.session("brave_search") as session:
+            tools = await load_mcp_tools(
+                session,
+                server_name="brave_search",
+            )
+            search_tool = self._find_brave_search_tool(tools)
+            search_results = await self._run_concurrent_searches(
+                search_tool,
+                search_queries,
+                metrics,
+            )
+            if not search_results:
+                fallback_queries = self._plan_fallback_search_queries(
+                    query,
+                    attempted_queries=search_queries,
+                )
+                if fallback_queries:
+                    search_results = await self._run_concurrent_searches(
+                        search_tool,
+                        fallback_queries,
+                        metrics,
+                    )
+
+        if not search_results:
+            if self.search_kind in EVIDENCE_LIMITS and metrics.search_calls and all(
+                call.status == "empty" for call in metrics.search_calls
+            ):
+                return AgentRunResult(
+                    response=self._empty_evidence_response(),
+                    metrics=metrics,
+                )
+            failures = [
+                f"{call.query}: {call.error_message or call.status}"
+                for call in metrics.search_calls
+            ]
+            raise SearchPipelineExecutionError(
+                f"所有 Brave 搜索均失败: {' | '.join(failures)}",
+                metrics,
+            )
+
+        response = await self._synthesize_search_results(query, search_results, metrics)
+        return AgentRunResult(response=response, metrics=metrics)
 
     def _resolve_npx_command(self) -> str:
         if sys.platform.startswith("win"):
             return shutil.which("npx.cmd") or shutil.which("npx.exe") or "npx.cmd"
         return shutil.which("npx") or "npx"
 
-    async def _run_mcp_tool_loop(self, search_tool: Any, query: str) -> str:
-        """让模型自主调用 MCP 工具,同时保留 reasoning_content 给 thinking 模型。"""
+    async def _run_concurrent_searches(
+        self,
+        search_tool: Any,
+        search_queries: List[str],
+        metrics: AgentRunMetrics,
+    ) -> List[Dict[str, str]]:
+        """使用同一个 MCP session 受控并发执行搜索。"""
+        semaphore = asyncio.Semaphore(SEARCH_MAX_CONCURRENCY)
+        call_traces = [
+            SearchCallTrace(query=search_query, status="pending")
+            for search_query in search_queries
+        ]
+        metrics.search_calls.extend(call_traces)
+
+        async def execute_one(call_trace: SearchCallTrace) -> Optional[Dict[str, str]]:
+            started_at: Optional[float] = None
+            try:
+                async with semaphore:
+                    started_at = time.perf_counter()
+                    call_trace.status = "running"
+                    result = await asyncio.wait_for(
+                        search_tool.ainvoke({"query": call_trace.query}),
+                        timeout=SEARCH_CALL_TIMEOUT_SECONDS,
+                    )
+                    result_text = self._tool_result_to_text(result)
+                    if self._is_no_results_message(result_text):
+                        call_trace.status = "empty"
+                        call_trace.error_type = "NoResults"
+                        call_trace.error_message = result_text.strip() or "No web results found"
+                        return None
+                    call_trace.status = "success"
+                    call_trace.result_chars = len(result_text)
+                    return {
+                        "query": call_trace.query,
+                        "content": result_text[:MAX_SEARCH_RESULT_CHARS],
+                    }
+            except TimeoutError:
+                call_trace.status = "failed"
+                call_trace.error_type = "TimeoutError"
+                call_trace.error_message = (
+                    f"单次搜索超过{SEARCH_CALL_TIMEOUT_SECONDS}秒"
+                )
+                return None
+            except asyncio.CancelledError:
+                call_trace.status = "cancelled"
+                call_trace.error_type = "CancelledError"
+                call_trace.error_message = "节点整体超时,搜索已取消"
+                raise
+            except Exception as exc:
+                error_message = str(exc)
+                if self._is_no_results_message(error_message):
+                    call_trace.status = "empty"
+                    call_trace.error_type = "NoResults"
+                else:
+                    call_trace.status = "failed"
+                    call_trace.error_type = type(exc).__name__
+                call_trace.error_message = error_message
+                return None
+            finally:
+                if started_at is not None:
+                    call_trace.duration_ms = int(
+                        (time.perf_counter() - started_at) * 1000
+                    )
+
+        results = await asyncio.gather(
+            *(execute_one(call_trace) for call_trace in call_traces)
+        )
+        return [result for result in results if result is not None]
+
+    async def _synthesize_search_results(
+        self,
+        query: str,
+        search_results: List[Dict[str, str]],
+        metrics: AgentRunMetrics,
+    ) -> str:
+        """基于并发搜索结果进行一次结构化模型生成。"""
         llm_config = get_llm_config()
-        client = AsyncOpenAI(
+        evidence_limit = EVIDENCE_LIMITS.get(self.search_kind)
+        limit_instruction = (
+            f"每个候选产品最多输出{evidence_limit}条证据。"
+            if evidence_limit
+            else ""
+        )
+        search_context = json.dumps(
+            search_results,
+            ensure_ascii=False,
+            indent=2,
+        )
+        synthesis_prompt = f"""{query}
+
+系统已经完成搜索。下面的搜索结果是唯一允许使用的外部事实来源。
+不要请求或假装再次调用工具，不要补充搜索结果之外的事实。
+{limit_instruction}
+
+搜索结果:
+{search_context}
+"""
+
+        started_at = time.perf_counter()
+        async with AsyncOpenAI(
             api_key=llm_config["api_key"],
             base_url=llm_config["base_url"],
             timeout=llm_config["timeout"],
-        )
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": query},
-        ]
-        tools = [self._search_tool_schema()]
-
-        for _ in range(6):
+        ) as client:
             completion = await client.chat.completions.create(
                 model=llm_config["model"],
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            self.system_prompt
+                            + "\n搜索工具已由系统执行完毕。请直接基于用户消息中的搜索结果返回目标JSON。"
+                        ),
+                    },
+                    {"role": "user", "content": synthesis_prompt},
+                ],
                 temperature=0,
             )
-            assistant_message = completion.choices[0].message
-            assistant_payload = self._assistant_message_to_payload(assistant_message)
-            messages.append(assistant_payload)
-
-            tool_calls = assistant_payload.get("tool_calls") or []
-            if not tool_calls:
-                return assistant_payload.get("content") or ""
-
-            for tool_call in tool_calls:
-                tool_result = await self._execute_model_tool_call(search_tool, tool_call)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": tool_result,
-                    }
-                )
-
-        raise RuntimeError("模型连续调用工具超过上限,未生成最终回答")
-
-    def _search_tool_schema(self) -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": SEARCH_TOOL_NAME,
-                "description": (
-                    "使用 Brave Search MCP Server 检索公开网页信息。"
-                    "只传 query 字段,不要传 search_lang、country 等额外参数。"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "搜索关键词",
-                        }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-
-    def _assistant_message_to_payload(self, message: Any) -> Dict[str, Any]:
-        raw = message.model_dump(exclude_none=True)
-        payload: Dict[str, Any] = {
-            "role": "assistant",
-            "content": raw.get("content"),
-        }
-        if raw.get("tool_calls"):
-            payload["tool_calls"] = raw["tool_calls"]
-        if raw.get("reasoning_content"):
-            payload["reasoning_content"] = raw["reasoning_content"]
-        return payload
-
-    async def _execute_model_tool_call(self, search_tool: Any, tool_call: Dict[str, Any]) -> str:
-        function = tool_call.get("function") or {}
-        tool_name = function.get("name")
-        if tool_name != SEARCH_TOOL_NAME:
-            return f"不支持的工具: {tool_name}"
-
-        try:
-            arguments = json.loads(function.get("arguments") or "{}")
-        except json.JSONDecodeError as exc:
-            return f"工具参数不是合法 JSON: {exc}"
-
-        search_query = str(arguments.get("query") or "").strip()
-        if not search_query:
-            return "工具参数缺少 query"
-
-        result = await search_tool.ainvoke(
-            {
-                "query": search_query,
-                "search_lang": "zh-hans",
-            }
+        metrics.model_duration_ms = int(
+            (time.perf_counter() - started_at) * 1000
         )
-        return self._tool_result_to_text(result)
+        return self._message_to_text(completion.choices[0].message)
+
+    def _plan_search_queries(self, query: str) -> List[str]:
+        """根据 Agent 类型为候选产品生成数量受控的确定性搜索计划。"""
+        candidate_names = [
+            self._compact_search_subject(candidate_name)
+            for candidate_name in self._extract_candidate_names(query)
+        ]
+
+        if self.search_kind == "review" and candidate_names:
+            planned = [
+                search_query
+                for candidate_name in candidate_names
+                for search_query in (
+                    f"{candidate_name} 评测 使用体验",
+                    f"{candidate_name} 缺点 用户评价",
+                )
+            ]
+        elif self.search_kind == "price" and candidate_names:
+            planned = [
+                f"{candidate_name} 价格 京东"
+                for candidate_name in candidate_names
+            ]
+        elif self.search_kind == "risk" and candidate_names:
+            planned = [
+                search_query
+                for candidate_name in candidate_names
+                for search_query in (
+                    f"{candidate_name} 缺点 投诉 售后",
+                    f"{candidate_name} 故障 翻车",
+                )
+            ]
+        else:
+            planned = self._extract_search_queries(query)
+
+        return self._deduplicate_queries(planned, limit=6) or [
+            " ".join(query.split())[:200]
+        ]
+
+    def _plan_fallback_search_queries(
+        self,
+        query: str,
+        attempted_queries: List[str],
+    ) -> List[str]:
+        """首轮全空时仅使用商品核心名进行宽泛回退。"""
+        attempted = {" ".join(item.split()) for item in attempted_queries}
+        candidate_names = [
+            self._compact_search_subject(candidate_name)
+            for candidate_name in self._extract_candidate_names(query)
+        ]
+        fallback_queries = [
+            candidate_name
+            for candidate_name in candidate_names
+            if candidate_name and candidate_name not in attempted
+        ]
+        return self._deduplicate_queries(fallback_queries, limit=3)
+
+    def _compact_search_subject(self, candidate_name: str) -> str:
+        """移除不利于召回的引号和通用商品后缀,保留品牌与型号。"""
+        compacted = " ".join(candidate_name.strip(' "\'“”').split())
+        generic_suffixes = (
+            "游戏笔记本电脑",
+            "笔记本电脑",
+            "游戏笔记本",
+            "笔记本",
+            "游戏本",
+            "电脑",
+        )
+        for suffix in generic_suffixes:
+            if compacted.endswith(suffix):
+                compacted = compacted[: -len(suffix)].strip()
+                break
+        return compacted or " ".join(candidate_name.split())
+
+    def _deduplicate_queries(self, queries: List[str], limit: int) -> List[str]:
+        unique_queries = []
+        seen = set()
+        for search_query in queries:
+            normalized = " ".join(search_query.split())
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                unique_queries.append(normalized)
+        return unique_queries[:limit]
+
+    def _is_no_results_message(self, message: str) -> bool:
+        normalized = message.strip().lower()
+        return not normalized or any(
+            marker in normalized
+            for marker in (
+                "no web results found",
+                "no results found",
+                "未找到搜索结果",
+                "没有找到搜索结果",
+            )
+        )
+
+    def _empty_evidence_response(self) -> str:
+        kind_labels = {
+            "review": "测评",
+            "price": "价格",
+            "risk": "风险",
+        }
+        kind_label = kind_labels.get(self.search_kind, "相关")
+        return json.dumps(
+            {
+                "evidence": [],
+                "coverage_notes": [
+                    f"Brave Search 未检索到可用{kind_label}证据,报告不得据此作确定性结论。"
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    def _extract_candidate_names(self, query: str) -> List[str]:
+        candidate_names = []
+        for line in query.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- ") or "（品牌:" not in stripped:
+                continue
+            candidate_name = stripped[2:].split("（品牌:", 1)[0].strip()
+            if candidate_name:
+                candidate_names.append(candidate_name)
+        return candidate_names[:3]
 
     def _extract_search_queries(self, query: str) -> List[str]:
         queries = []
@@ -365,8 +653,30 @@ REVIEW_COLLECTOR_PROMPT = """你是购物测评搜集专家。你的任务是使
 4. 只允许基于检索结果写入作者、标题、平台、立场、观点等信息,禁止自行补全
 5. 如果某个候选产品缺少足够测评证据,必须明确写出"信息不足",不要把其他产品的测评挪用过来
 6. 如果不同来源观点冲突,必须保留冲突原文含义,不要强行统一结论
-7. 输出时按候选产品分组,每个候选产品分别写: 来源覆盖情况、主要观点、疑似广告情况、信息不足项、冲突点
+7. 每条证据必须绑定一个候选产品标准名称,并保留来源URL、标题、平台、作者、原始摘要和该来源直接支持的claims
+8. evidence_id使用review_001、review_002格式,不要跨产品复用同一个ID
+9. 每个候选产品最多输出3条最有代表性的测评证据,优先保留不同平台和不同立场的来源
 
+请严格返回JSON:
+```json
+{
+  "evidence": [
+    {
+      "evidence_id": "review_001",
+      "product_name": "候选产品标准名称",
+      "evidence_type": "review",
+      "source_url": "https://...",
+      "source_title": "来源标题",
+      "platform": "B站/小红书/知乎/其他",
+      "author": "作者或发布主体",
+      "snippet": "检索结果中的原始摘要或关键片段",
+      "claims": ["该来源直接支持的观点1", "观点2"],
+      "search_query": "实际使用的搜索关键词"
+    }
+  ],
+  "coverage_notes": ["来源覆盖不足或信息不足说明"]
+}
+```
 """
 
 PRICE_COLLECTOR_PROMPT = """你是价格对比专家。你的任务是使用搜索工具查找产品在各大电商平台的价格信息和型号对比。
@@ -389,6 +699,30 @@ PRICE_COLLECTOR_PROMPT = """你是价格对比专家。你的任务是使用搜�
 4. 优先覆盖2个及以上电商或资讯来源;如果来源覆盖不足,必须明确写出"来源覆盖不足"
 5. 如果候选产品价格信息不存在或价格区间差异过大,必须写"信息不足"或"价格存在冲突"
 6. 不要把A型号的价格写到B型号名下,必须按候选产品逐个归档
+7. 每条证据必须保留来源URL、标题、平台、摘要和该来源直接支持的价格/参数claims
+8. evidence_id使用price_001、price_002格式
+9. 每个候选产品最多输出2条价格证据,优先保留来源不同且能代表当前价格区间的结果
+
+请严格返回JSON:
+```json
+{
+  "evidence": [
+    {
+      "evidence_id": "price_001",
+      "product_name": "候选产品标准名称",
+      "evidence_type": "price",
+      "source_url": "https://...",
+      "source_title": "商品页或资讯标题",
+      "platform": "京东/淘宝/拼多多/官网/其他",
+      "author": "店铺或发布主体",
+      "snippet": "检索结果中的价格或参数原始摘要",
+      "claims": ["价格区间或参数事实"],
+      "search_query": "实际使用的搜索关键词"
+    }
+  ],
+  "coverage_notes": ["价格冲突或来源覆盖不足说明"]
+}
+```
 """
 
 RED_FLAG_DETECTOR_PROMPT = """你是产品避雷专家。你的任务是使用搜索工具专门查找产品的负面信息、投诉、已知缺陷和恰饭测评。
@@ -413,6 +747,30 @@ RED_FLAG_DETECTOR_PROMPT = """你是产品避雷专家。你的任务是使用�
 5. 如果某个候选产品没有搜到明确负面信息,请写"未检索到明确负面证据",不要反向推断为没有问题
 6. 如果负面观点之间存在冲突,必须单列冲突点,不要直接下确定性结论
 7. 不要把某个品牌的通病直接写成某个具体型号的确定缺陷,除非检索结果明确指向该型号
+8. 每条风险证据必须保留来源URL、标题、平台、摘要和该来源直接支持的风险claims
+9. evidence_id使用risk_001、risk_002格式
+10. 每个候选产品最多输出3条风险证据,优先保留具体、可定位且来源不同的风险信号
+
+请严格返回JSON:
+```json
+{
+  "evidence": [
+    {
+      "evidence_id": "risk_001",
+      "product_name": "候选产品标准名称",
+      "evidence_type": "risk",
+      "source_url": "https://...",
+      "source_title": "投诉、差评或风险来源标题",
+      "platform": "投诉平台/论坛/媒体/其他",
+      "author": "作者或发布主体",
+      "snippet": "检索结果中的原始风险摘要",
+      "claims": ["该来源直接支持的风险点"],
+      "search_query": "实际使用的搜索关键词"
+    }
+  ],
+  "coverage_notes": ["未检索到明确负面证据或来源不足说明"]
+}
+```
 """
 
 REPORT_GENERATOR_PROMPT = """你是避雷购物报告撰写专家。你的任务是根据测评信息、价格信息和避雷信息,生成结构化的购物避雷报告。
@@ -431,7 +789,9 @@ REPORT_GENERATOR_PROMPT = """你是避雷购物报告撰写专家。你的任务
         "price_range": "1000-2000元",
         "rating": 8.5,
         "image_url": null,
-        "specs": {"关键参数1": "值1", "关键参数2": "值2"}
+        "specs": {"关键参数1": "值1", "关键参数2": "值2"},
+        "price_evidence_ids": ["price_001"],
+        "spec_evidence_ids": ["price_002"]
       },
       "reviews": [
         {
@@ -442,7 +802,8 @@ REPORT_GENERATOR_PROMPT = """你是避雷购物报告撰写专家。你的任务
           "stance": "推荐",
           "is_sponsored": false,
           "key_points": ["观点1", "观点2"],
-          "credibility_score": 8.0
+          "credibility_score": 8.0,
+          "evidence_ids": ["review_001"]
         }
       ],
       "common_pros": ["公认优点1", "公认优点2"],
@@ -450,13 +811,21 @@ REPORT_GENERATOR_PROMPT = """你是避雷购物报告撰写专家。你的任务
       "red_flags": ["避雷点1", "避雷点2"],
       "controversy_points": ["争议点1"],
       "verdict": "推荐",
-      "verdict_reason": "综合评价理由"
+      "verdict_reason": "综合评价理由",
+      "pro_evidence_ids": {"公认优点1": ["review_001"]},
+      "con_evidence_ids": {"公认缺点1": ["review_002"]},
+      "red_flag_evidence_ids": {"避雷点1": ["risk_001"]},
+      "controversy_evidence_ids": {"争议点1": ["review_001", "review_002"]},
+      "verdict_evidence_ids": ["review_001", "price_001", "risk_001"]
     }
   ],
   "comparison_summary": "横向对比总结",
   "final_recommendation": "最终购买建议",
   "budget_advice": "预算建议",
-  "general_tips": ["选购建议1", "选购建议2"]
+  "general_tips": ["选购建议1", "选购建议2"],
+  "comparison_evidence_ids": ["review_001", "price_001"],
+  "recommendation_evidence_ids": ["review_001", "price_001", "risk_001"],
+  "budget_evidence_ids": ["price_001"]
 }
 ```
 
@@ -470,6 +839,10 @@ REPORT_GENERATOR_PROMPT = """你是避雷购物报告撰写专家。你的任务
 7. 如果用户指定了预算范围,给出具体的预算建议
 8. 分析至少2-3个主流产品/型号
 9. general_tips给出该品类的通用选购建议
+10. 所有 evidence_ids 只能引用上游证据中真实存在的 evidence_id,禁止编造ID
+11. 价格字段只能引用price证据; reviews主要引用review证据; red_flags必须引用risk或review证据
+12. 产品级字段不能引用其他候选产品的证据
+13. common_pros/common_cons中的价格、性价比、预算类结论可以引用price证据;体验类优缺点应引用review或risk证据
 
 **边界要求:**
 1. product.name、brand、model、price_range、specs、reviews、red_flags、common_pros、common_cons、verdict_reason 只能基于上游检索结果填写
@@ -481,6 +854,7 @@ REPORT_GENERATOR_PROMPT = """你是避雷购物报告撰写专家。你的任务
 7. final_recommendation必须体现证据强弱: 证据充分时给明确建议,证据不足时给保守建议
 8. comparison_summary中必须说明来源覆盖情况和主要冲突信息,不能只写结论
 9. 严禁把候选产品之外的型号写入products列表
+10. 没有证据支持的字段必须保守留空,对应evidence_ids也必须为空
 """
 
 
@@ -501,6 +875,7 @@ class MultiAgentShoppingAdvisor:
                 llm=self.llm,
                 system_prompt=CANDIDATE_EXTRACTOR_PROMPT,
                 uses_search=True,
+                search_kind="candidate",
             )
 
             # 创建测评搜集Agent
@@ -510,6 +885,7 @@ class MultiAgentShoppingAdvisor:
                 llm=self.llm,
                 system_prompt=REVIEW_COLLECTOR_PROMPT,
                 uses_search=True,
+                search_kind="review",
             )
 
             # 创建价格对比Agent
@@ -519,6 +895,7 @@ class MultiAgentShoppingAdvisor:
                 llm=self.llm,
                 system_prompt=PRICE_COLLECTOR_PROMPT,
                 uses_search=True,
+                search_kind="price",
             )
 
             # 创建避雷检测Agent
@@ -528,6 +905,7 @@ class MultiAgentShoppingAdvisor:
                 llm=self.llm,
                 system_prompt=RED_FLAG_DETECTOR_PROMPT,
                 uses_search=True,
+                search_kind="risk",
             )
 
             # 创建报告生成Agent(不需要工具)
@@ -628,8 +1006,7 @@ class MultiAgentShoppingAdvisor:
                 candidate_result = self._parse_candidate_response(candidate_step.response)
             except Exception as exc:
                 print(f"⚠️  候选产品解析失败,切换默认候选方案: {exc}")
-                candidate_step.ok = False
-                candidate_step.error = exc
+                self._mark_step_postprocess_failure(candidate_step, exc)
                 candidate_result = self._create_fallback_candidates(request)
         else:
             print("⚠️  候选产品抽取失败,切换默认候选方案")
@@ -646,6 +1023,7 @@ class MultiAgentShoppingAdvisor:
             message="候选产品抽取完成" if candidate_step.ok else "候选抽取失败,已使用用户原始查询作为默认候选",
             error=candidate_step.error,
             partial=not candidate_step.ok,
+            step_result=candidate_step,
         )
 
         return {
@@ -667,7 +1045,22 @@ class MultiAgentShoppingAdvisor:
             retries=DEFAULT_TOOL_RETRIES,
             uses_tools=True,
         )
-        review_response = self._step_response_payload(review_step)
+        review_evidence: List[EvidenceItem] = []
+        if review_step.ok:
+            try:
+                review_evidence = self._parse_evidence_response(
+                    response=review_step.response,
+                    repair_agent=self.report_agent,
+                    repair_label="测评证据JSON",
+                    evidence_type="review",
+                    candidates=candidates,
+                )
+                review_response = self._serialize_evidence(review_evidence)
+            except Exception as exc:
+                self._mark_step_postprocess_failure(review_step, exc)
+                review_response = self._step_response_payload(review_step)
+        else:
+            review_response = self._step_response_payload(review_step)
         print(f"测评搜集状态: {review_step.status_text}")
         self._trace_step_finish(
             state=state,
@@ -677,10 +1070,12 @@ class MultiAgentShoppingAdvisor:
             ok=review_step.ok,
             message="测评搜集完成" if review_step.ok else "测评搜集失败,报告将标注证据边界",
             error=review_step.error,
+            step_result=review_step,
         )
 
         return {
             "review_step": review_step,
+            "review_evidence": review_evidence,
             "review_response": review_response,
         }
 
@@ -697,7 +1092,22 @@ class MultiAgentShoppingAdvisor:
             retries=DEFAULT_TOOL_RETRIES,
             uses_tools=True,
         )
-        price_response = self._step_response_payload(price_step)
+        price_evidence: List[EvidenceItem] = []
+        if price_step.ok:
+            try:
+                price_evidence = self._parse_evidence_response(
+                    response=price_step.response,
+                    repair_agent=self.report_agent,
+                    repair_label="价格证据JSON",
+                    evidence_type="price",
+                    candidates=candidates,
+                )
+                price_response = self._serialize_evidence(price_evidence)
+            except Exception as exc:
+                self._mark_step_postprocess_failure(price_step, exc)
+                price_response = self._step_response_payload(price_step)
+        else:
+            price_response = self._step_response_payload(price_step)
         print(f"价格对比状态: {price_step.status_text}")
         self._trace_step_finish(
             state=state,
@@ -707,10 +1117,12 @@ class MultiAgentShoppingAdvisor:
             ok=price_step.ok,
             message="价格对比完成" if price_step.ok else "价格对比失败,报告将标注证据边界",
             error=price_step.error,
+            step_result=price_step,
         )
 
         return {
             "price_step": price_step,
+            "price_evidence": price_evidence,
             "price_response": price_response,
         }
 
@@ -727,7 +1139,22 @@ class MultiAgentShoppingAdvisor:
             retries=DEFAULT_TOOL_RETRIES,
             uses_tools=True,
         )
-        red_flag_response = self._step_response_payload(red_flag_step)
+        red_flag_evidence: List[EvidenceItem] = []
+        if red_flag_step.ok:
+            try:
+                red_flag_evidence = self._parse_evidence_response(
+                    response=red_flag_step.response,
+                    repair_agent=self.report_agent,
+                    repair_label="风险证据JSON",
+                    evidence_type="risk",
+                    candidates=candidates,
+                )
+                red_flag_response = self._serialize_evidence(red_flag_evidence)
+            except Exception as exc:
+                self._mark_step_postprocess_failure(red_flag_step, exc)
+                red_flag_response = self._step_response_payload(red_flag_step)
+        else:
+            red_flag_response = self._step_response_payload(red_flag_step)
         print(f"避雷检测状态: {red_flag_step.status_text}")
         self._trace_step_finish(
             state=state,
@@ -737,10 +1164,12 @@ class MultiAgentShoppingAdvisor:
             ok=red_flag_step.ok,
             message="避雷检测完成" if red_flag_step.ok else "避雷检测失败,报告将标注证据边界",
             error=red_flag_step.error,
+            step_result=red_flag_step,
         )
 
         return {
             "red_flag_step": red_flag_step,
+            "red_flag_evidence": red_flag_evidence,
             "red_flag_response": red_flag_response,
         }
 
@@ -760,6 +1189,11 @@ class MultiAgentShoppingAdvisor:
                 if step_result is not None
             }
         )
+        all_evidence = [
+            *state.get("review_evidence", []),
+            *state.get("price_evidence", []),
+            *state.get("red_flag_evidence", []),
+        ]
 
         print("📊 步骤5: 生成避雷报告...")
         trace_event_id = self._trace_step_start(state, "report", "报告生成")
@@ -784,6 +1218,12 @@ class MultiAgentShoppingAdvisor:
         if report_step.ok:
             try:
                 report = self._parse_response(report_step.response, request)
+                report.evidence = all_evidence
+                report_scope_partial = self._normalize_report_products(
+                    report,
+                    candidates,
+                )
+                self._validate_report_citations(report, candidates)
                 print(f"{'='*60}")
                 print(f"✅ 避雷报告生成完成!")
                 print(f"{'='*60}\n")
@@ -793,7 +1233,13 @@ class MultiAgentShoppingAdvisor:
                     step_key="report",
                     step_name="报告生成",
                     ok=True,
-                    message="报告生成完成",
+                    message=(
+                        "报告生成完成,已隔离无法安全归属的产品项"
+                        if report_scope_partial
+                        else "报告生成完成"
+                    ),
+                    partial=report_scope_partial,
+                    step_result=report_step,
                 )
                 return {
                     "step_results": step_results,
@@ -801,8 +1247,7 @@ class MultiAgentShoppingAdvisor:
                 }
             except Exception as exc:
                 print(f"⚠️  报告解析失败,改为输出部分成功汇总: {exc}")
-                report_step.ok = False
-                report_step.error = exc
+                self._mark_step_postprocess_failure(report_step, exc)
 
         print("⚠️  报告生成未完整成功,返回部分成功汇总结果")
         print(f"{'='*60}\n")
@@ -815,10 +1260,16 @@ class MultiAgentShoppingAdvisor:
             message="报告生成降级为部分成功汇总",
             error=report_step.error,
             partial=True,
+            step_result=report_step,
         )
         return {
             "step_results": step_results,
-            "report": self._create_partial_report(request, candidates, step_results),
+            "report": self._create_partial_report(
+                request,
+                candidates,
+                step_results,
+                evidence=all_evidence,
+            ),
         }
 
     def _trace_step_start(self, state: ShoppingAdvisorState, step_key: str, step_name: str) -> Optional[str]:
@@ -841,6 +1292,7 @@ class MultiAgentShoppingAdvisor:
         message: str,
         error: Optional[Exception] = None,
         partial: bool = False,
+        step_result: Optional[StepResult] = None,
     ):
         tracer = state.get("tracer")
         if not tracer or not event_id:
@@ -854,6 +1306,8 @@ class MultiAgentShoppingAdvisor:
                 message=message,
                 error=error,
                 partial=partial,
+                attempts=step_result.attempts if step_result else None,
+                tool_call_count=step_result.tool_call_count if step_result else 0,
             )
         except Exception as exc:
             print(f"⚠️  Trace结束事件写入失败: {exc}")
@@ -925,6 +1379,10 @@ class MultiAgentShoppingAdvisor:
     ) -> str:
         """构建报告生成查询"""
         candidate_text = self._format_candidate_targets(candidates)
+        canonical_candidate_names = json.dumps(
+            [candidate.name for candidate in candidates],
+            ensure_ascii=False,
+        )
         step_status = self._format_step_status(step_results)
         query = f"""请根据以下信息生成"{request.product_name}"的避雷购物报告:
 
@@ -937,6 +1395,9 @@ class MultiAgentShoppingAdvisor:
 
 **候选产品(后续所有信息都必须围绕这些产品对齐):**
 {candidate_text}
+
+**候选产品名称白名单(JSON):**
+{canonical_candidate_names}
 
 **步骤执行状态:**
 {step_status}
@@ -960,6 +1421,8 @@ class MultiAgentShoppingAdvisor:
 7. 给出明确的购买建议
 8. 返回完整的JSON格式数据
 9. 如果某些上游步骤失败,请基于成功步骤继续汇总,并在comparison_summary、final_recommendation、verdict_reason中明确说明缺失项和证据边界
+10. products[].product.name必须逐字复制候选产品名称白名单中的字符串,不能添加括号、别名、系列名或“含某衍生款”等说明
+11. 不要把多个候选产品合并为一个系列产品;每个products元素只能对应一个候选产品
 """
         if request.free_text_input:
             query += f"\n**额外要求:** {request.free_text_input}"
@@ -993,6 +1456,133 @@ class MultiAgentShoppingAdvisor:
         if not result.candidates:
             raise ValueError("候选产品为空")
         return result
+
+    def _parse_evidence_response(
+        self,
+        response: str,
+        repair_agent: Any,
+        repair_label: str,
+        evidence_type: str,
+        candidates: List[CandidateProduct],
+    ) -> List[EvidenceItem]:
+        """解析检索节点输出,并在Python侧统一证据ID和候选产品名称。"""
+        data = self._load_json_payload(
+            response=response,
+            repair_agent=repair_agent,
+            repair_label=repair_label,
+        )
+        raw_evidence = data.get("evidence", [])
+        if not isinstance(raw_evidence, list):
+            raise ValueError(f"{repair_label}中的evidence必须是数组")
+
+        normalized_items = []
+        product_counts: Dict[str, int] = {}
+        seen_sources = set()
+        per_product_limit = EVIDENCE_LIMITS.get(evidence_type)
+
+        for index, raw_item in enumerate(raw_evidence, start=1):
+            if not isinstance(raw_item, dict):
+                raise ValueError(f"{repair_label}第{index}条证据不是对象")
+            item_data = dict(raw_item)
+            item_data["evidence_type"] = evidence_type
+            product_name = self._resolve_candidate_name(
+                item_data.get("product_name", ""),
+                candidates,
+            )
+            source_key = (
+                product_name,
+                str(item_data.get("source_url") or "").strip().lower(),
+                str(item_data.get("source_title") or "").strip().lower(),
+            )
+            if source_key in seen_sources:
+                continue
+            if (
+                per_product_limit is not None
+                and product_counts.get(product_name, 0) >= per_product_limit
+            ):
+                continue
+
+            item_data["product_name"] = product_name
+            item_data["evidence_id"] = (
+                f"{evidence_type}_{len(normalized_items) + 1:03d}"
+            )
+            normalized_items.append(EvidenceItem(**item_data))
+            product_counts[product_name] = product_counts.get(product_name, 0) + 1
+            seen_sources.add(source_key)
+
+        result = EvidenceCollectionResult(
+            evidence=normalized_items,
+            coverage_notes=data.get("coverage_notes", []),
+        )
+        return result.evidence
+
+    def _resolve_candidate_name(
+        self,
+        evidence_product_name: str,
+        candidates: List[CandidateProduct],
+    ) -> str:
+        """将证据中的产品名称对齐到候选产品标准名称。"""
+        normalized_evidence_name = self._normalize_product_name(evidence_product_name)
+        if not normalized_evidence_name:
+            raise ValueError("证据产品名称未填写")
+
+        exact_name_matches = [
+            candidate.name
+            for candidate in candidates
+            if normalized_evidence_name == self._normalize_product_name(candidate.name)
+        ]
+        if len(exact_name_matches) == 1:
+            return exact_name_matches[0]
+
+        exact_brand_model_matches = [
+            candidate.name
+            for candidate in candidates
+            if candidate.model
+            and normalized_evidence_name
+            == self._normalize_product_name(
+                f"{candidate.brand} {candidate.model}"
+            )
+        ]
+        if len(exact_brand_model_matches) == 1:
+            return exact_brand_model_matches[0]
+
+        exact_model_matches = [
+            candidate.name
+            for candidate in candidates
+            if candidate.model
+            and normalized_evidence_name == self._normalize_product_name(candidate.model)
+        ]
+        if len(exact_model_matches) == 1:
+            return exact_model_matches[0]
+
+        matches = []
+        for candidate in candidates:
+            candidate_name = self._normalize_product_name(candidate.name)
+            candidate_model = self._normalize_product_name(candidate.model)
+            if (
+                normalized_evidence_name in candidate_name
+                or candidate_name in normalized_evidence_name
+                or (candidate_model and candidate_model in normalized_evidence_name)
+            ):
+                distance = abs(len(candidate_name) - len(normalized_evidence_name))
+                matches.append((distance, candidate.name))
+
+        if not matches:
+            raise ValueError(f"证据产品不在候选列表中: {evidence_product_name or '未填写'}")
+        matches.sort(key=lambda item: item[0])
+        if len(matches) == 1 or matches[0][0] < matches[1][0]:
+            return matches[0][1]
+        raise ValueError(f"证据产品无法唯一对齐候选型号: {evidence_product_name}")
+
+    def _normalize_product_name(self, value: str) -> str:
+        return "".join(character.lower() for character in value if character.isalnum())
+
+    def _serialize_evidence(self, evidence: List[EvidenceItem]) -> str:
+        return json.dumps(
+            {"evidence": [item.model_dump(mode="json") for item in evidence]},
+            ensure_ascii=False,
+            indent=2,
+        )
 
     def _create_fallback_candidates(self, request: ShoppingRequest) -> CandidateExtractionResult:
         """候选产品抽取失败时的默认方案"""
@@ -1060,6 +1650,332 @@ class MultiAgentShoppingAdvisor:
         )
         return ShoppingReport(**data)
 
+    def _normalize_report_products(
+        self,
+        report: ShoppingReport,
+        candidates: List[CandidateProduct],
+    ) -> bool:
+        """将报告产品确定性对齐到候选白名单,隔离无法安全归属的系列汇总项。"""
+        candidate_by_name = {
+            candidate.name: candidate
+            for candidate in candidates
+        }
+        evidence_by_id = {
+            item.evidence_id: item
+            for item in report.evidence
+        }
+        normalized_products: List[ProductAnalysis] = []
+        seen_candidates = set()
+        warnings = list(report.citation_warnings)
+        scope_partial = False
+
+        for analysis in report.products:
+            original_name = analysis.product.name
+            candidate_name = self._resolve_report_candidate(
+                analysis,
+                candidates,
+                evidence_by_id,
+            )
+            if candidate_name is None:
+                warnings.append(
+                    f"已移除无法唯一对齐候选型号的报告产品: {original_name}"
+                )
+                scope_partial = True
+                continue
+
+            normalized_key = self._normalize_product_name(candidate_name)
+            if normalized_key in seen_candidates:
+                warnings.append(
+                    f"已移除重复的报告产品分析: {original_name} -> {candidate_name}"
+                )
+                scope_partial = True
+                continue
+
+            candidate = candidate_by_name[candidate_name]
+            if original_name != candidate.name:
+                warnings.append(
+                    f"报告产品名称已归一化: {original_name} -> {candidate.name}"
+                )
+            analysis.product.name = candidate.name
+            analysis.product.brand = candidate.brand or analysis.product.brand
+            analysis.product.model = candidate.model or analysis.product.model
+            normalized_products.append(analysis)
+            seen_candidates.add(normalized_key)
+
+        if not normalized_products:
+            raise CitationValidationError(
+                ["报告中的产品均无法唯一对齐候选产品白名单"]
+            )
+
+        report.products = normalized_products
+        report.citation_warnings = warnings
+        return scope_partial
+
+    def _resolve_report_candidate(
+        self,
+        analysis: ProductAnalysis,
+        candidates: List[CandidateProduct],
+        evidence_by_id: Dict[str, EvidenceItem],
+    ) -> Optional[str]:
+        """结合报告产品字段和引用证据确定唯一候选产品。"""
+        cited_product_names = {
+            evidence_by_id[evidence_id].product_name
+            for evidence_id in self._collect_analysis_evidence_ids(analysis)
+            if evidence_id in evidence_by_id
+        }
+        resolved_cited_names = set()
+        for cited_name in cited_product_names:
+            try:
+                resolved_cited_names.add(
+                    self._resolve_candidate_name(cited_name, candidates)
+                )
+            except ValueError:
+                return None
+        if len(resolved_cited_names) > 1:
+            return None
+
+        candidate_signals = [
+            analysis.product.name,
+            f"{analysis.product.brand} {analysis.product.model}".strip(),
+            analysis.product.model,
+        ]
+        resolved_names = set()
+        for signal in candidate_signals:
+            if not signal:
+                continue
+            if signal == analysis.product.name and self._is_grouped_product_name(signal):
+                continue
+            try:
+                resolved_names.add(
+                    self._resolve_candidate_name(signal, candidates)
+                )
+            except ValueError:
+                continue
+
+        if len(resolved_names) > 1:
+            return None
+        if len(resolved_names) == 1 and len(resolved_cited_names) == 1:
+            resolved_name = next(iter(resolved_names))
+            cited_name = next(iter(resolved_cited_names))
+            return resolved_name if resolved_name == cited_name else None
+        if len(resolved_names) == 1:
+            return next(iter(resolved_names))
+        if len(resolved_cited_names) == 1:
+            return next(iter(resolved_cited_names))
+
+        return None
+
+    def _is_grouped_product_name(self, value: str) -> bool:
+        grouped_markers = (
+            "（含",
+            "(含",
+            "系列",
+            "衍生款",
+            "等型号",
+            "等版本",
+        )
+        return any(marker in value for marker in grouped_markers)
+
+    def _collect_analysis_evidence_ids(
+        self,
+        analysis: ProductAnalysis,
+    ) -> set[str]:
+        evidence_ids = {
+            *analysis.product.price_evidence_ids,
+            *analysis.product.spec_evidence_ids,
+            *analysis.verdict_evidence_ids,
+        }
+        for review in analysis.reviews:
+            evidence_ids.update(review.evidence_ids)
+        for citation_map in (
+            analysis.pro_evidence_ids,
+            analysis.con_evidence_ids,
+            analysis.red_flag_evidence_ids,
+            analysis.controversy_evidence_ids,
+        ):
+            for mapped_ids in citation_map.values():
+                evidence_ids.update(mapped_ids)
+        return evidence_ids
+
+    def _validate_report_citations(
+        self,
+        report: ShoppingReport,
+        candidates: List[CandidateProduct],
+    ):
+        """确定性校验报告中的证据引用、类型和产品归因。"""
+        evidence_by_id: Dict[str, EvidenceItem] = {}
+        hard_issues: List[str] = []
+        warnings: List[str] = list(report.citation_warnings)
+
+        for item in report.evidence:
+            if item.evidence_id in evidence_by_id:
+                hard_issues.append(f"重复证据ID: {item.evidence_id}")
+            evidence_by_id[item.evidence_id] = item
+
+        candidate_names = {
+            self._normalize_product_name(candidate.name)
+            for candidate in candidates
+        }
+
+        def validate_ids(
+            field_name: str,
+            evidence_ids: List[str],
+            allowed_types: Optional[set[str]] = None,
+            product_name: Optional[str] = None,
+        ):
+            for evidence_id in evidence_ids:
+                evidence = evidence_by_id.get(evidence_id)
+                if evidence is None:
+                    hard_issues.append(f"{field_name}引用不存在的证据ID: {evidence_id}")
+                    continue
+                if allowed_types and evidence.evidence_type not in allowed_types:
+                    hard_issues.append(
+                        f"{field_name}引用了错误类型证据: {evidence_id}({evidence.evidence_type})"
+                    )
+                if product_name and not self._same_product(product_name, evidence.product_name):
+                    hard_issues.append(
+                        f"{field_name}跨产品引用: {product_name} -> {evidence.product_name}({evidence_id})"
+                    )
+
+        for analysis_index, analysis in enumerate(report.products):
+            product_name = analysis.product.name
+            if self._normalize_product_name(product_name) not in candidate_names:
+                hard_issues.append(f"报告包含候选范围外产品: {product_name}")
+
+            validate_ids(
+                f"products[{analysis_index}].price_evidence_ids",
+                analysis.product.price_evidence_ids,
+                {"price"},
+                product_name,
+            )
+            validate_ids(
+                f"products[{analysis_index}].spec_evidence_ids",
+                analysis.product.spec_evidence_ids,
+                {"price", "review"},
+                product_name,
+            )
+            if (
+                analysis.product.price_range
+                and analysis.product.price_range not in {"信息不足", "暂无数据"}
+                and not analysis.product.price_evidence_ids
+            ):
+                warnings.append(f"{product_name}的价格区间没有引用价格证据")
+
+            for review_index, review in enumerate(analysis.reviews):
+                validate_ids(
+                    f"products[{analysis_index}].reviews[{review_index}].evidence_ids",
+                    review.evidence_ids,
+                    {"review", "risk"},
+                    product_name,
+                )
+                if not review.evidence_ids:
+                    warnings.append(f"{product_name}的测评来源“{review.title}”没有引用证据")
+
+            self._validate_claim_map(
+                field_name=f"products[{analysis_index}].pro_evidence_ids",
+                claims=analysis.common_pros,
+                citation_map=analysis.pro_evidence_ids,
+                allowed_types={"review", "price"},
+                product_name=product_name,
+                validate_ids=validate_ids,
+                hard_issues=hard_issues,
+                warnings=warnings,
+            )
+            self._validate_claim_map(
+                field_name=f"products[{analysis_index}].con_evidence_ids",
+                claims=analysis.common_cons,
+                citation_map=analysis.con_evidence_ids,
+                allowed_types={"review", "price", "risk"},
+                product_name=product_name,
+                validate_ids=validate_ids,
+                hard_issues=hard_issues,
+                warnings=warnings,
+            )
+            self._validate_claim_map(
+                field_name=f"products[{analysis_index}].red_flag_evidence_ids",
+                claims=analysis.red_flags,
+                citation_map=analysis.red_flag_evidence_ids,
+                allowed_types={"risk", "review"},
+                product_name=product_name,
+                validate_ids=validate_ids,
+                hard_issues=hard_issues,
+                warnings=warnings,
+            )
+            self._validate_claim_map(
+                field_name=f"products[{analysis_index}].controversy_evidence_ids",
+                claims=analysis.controversy_points,
+                citation_map=analysis.controversy_evidence_ids,
+                allowed_types={"review", "risk"},
+                product_name=product_name,
+                validate_ids=validate_ids,
+                hard_issues=hard_issues,
+                warnings=warnings,
+            )
+            validate_ids(
+                f"products[{analysis_index}].verdict_evidence_ids",
+                analysis.verdict_evidence_ids,
+                {"review", "price", "risk"},
+                product_name,
+            )
+            if analysis.verdict_reason and not analysis.verdict_evidence_ids:
+                warnings.append(f"{product_name}的产品结论没有引用证据")
+
+        validate_ids(
+            "comparison_evidence_ids",
+            report.comparison_evidence_ids,
+            {"review", "price", "risk"},
+        )
+        validate_ids(
+            "recommendation_evidence_ids",
+            report.recommendation_evidence_ids,
+            {"review", "price", "risk"},
+        )
+        validate_ids(
+            "budget_evidence_ids",
+            report.budget_evidence_ids,
+            {"price"},
+        )
+
+        if report.evidence and report.comparison_summary and not report.comparison_evidence_ids:
+            warnings.append("横向对比总结没有引用证据")
+        if report.evidence and report.final_recommendation and not report.recommendation_evidence_ids:
+            warnings.append("最终购买建议没有引用证据")
+        if report.budget_advice and report.evidence and not report.budget_evidence_ids:
+            warnings.append("预算建议没有引用价格证据")
+
+        report.citation_warnings = warnings
+        if hard_issues:
+            raise CitationValidationError(hard_issues)
+
+    def _validate_claim_map(
+        self,
+        field_name: str,
+        claims: List[str],
+        citation_map: Dict[str, List[str]],
+        allowed_types: set[str],
+        product_name: str,
+        validate_ids: Any,
+        hard_issues: List[str],
+        warnings: List[str],
+    ):
+        claim_set = set(claims)
+        for claim, evidence_ids in citation_map.items():
+            if claim not in claim_set:
+                hard_issues.append(f"{field_name}包含不存在的结论文本: {claim}")
+            validate_ids(field_name, evidence_ids, allowed_types, product_name)
+        for claim in claims:
+            if not citation_map.get(claim):
+                warnings.append(f"{product_name}的结论“{claim}”没有引用证据")
+
+    def _same_product(self, left: str, right: str) -> bool:
+        normalized_left = self._normalize_product_name(left)
+        normalized_right = self._normalize_product_name(right)
+        return (
+            normalized_left == normalized_right
+            or normalized_left in normalized_right
+            or normalized_right in normalized_left
+        )
+
     def _load_json_payload(self, response: str, repair_agent: Any, repair_label: str) -> Dict[str, Any]:
         """解析 JSON,失败后执行一次 repair pass"""
         try:
@@ -1112,24 +2028,88 @@ class MultiAgentShoppingAdvisor:
     ) -> StepResult:
         """执行单个 Agent 步骤,包含超时、重试和错误分类"""
         last_error: Optional[Exception] = None
+        attempts: List[StepAttemptTrace] = []
+        total_tool_calls = 0
 
         for attempt in range(1, retries + 2):
+            attempt_started_at = time.perf_counter()
+            metrics = AgentRunMetrics()
             try:
-                response = self._run_agent_with_timeout(
+                run_result = self._run_agent_with_timeout(
                     step_name=step_name,
                     agent=agent,
                     query=query,
                     timeout_seconds=timeout_seconds,
                     uses_tools=uses_tools,
                 )
+                response = run_result.response
+                metrics = run_result.metrics
                 if uses_tools:
                     self._ensure_tool_success(step_name, response)
-                return StepResult(name=step_name, ok=True, response=response)
+                duration_ms = int(
+                    (time.perf_counter() - attempt_started_at) * 1000
+                )
+                total_tool_calls += metrics.tool_call_count
+                attempts.append(
+                    StepAttemptTrace(
+                        attempt=attempt,
+                        status="success",
+                        duration_ms=duration_ms,
+                        tool_call_count=metrics.tool_call_count,
+                        model_duration_ms=metrics.model_duration_ms,
+                        search_calls=metrics.search_calls,
+                    )
+                )
+                return StepResult(
+                    name=step_name,
+                    ok=True,
+                    response=response,
+                    attempts=attempts,
+                    tool_call_count=total_tool_calls,
+                )
             except Exception as exc:
                 last_error = exc
+                metrics = getattr(exc, "metrics", metrics)
+                duration_ms = int(
+                    (time.perf_counter() - attempt_started_at) * 1000
+                )
+                total_tool_calls += metrics.tool_call_count
+                attempts.append(
+                    StepAttemptTrace(
+                        attempt=attempt,
+                        status="failed",
+                        duration_ms=duration_ms,
+                        tool_call_count=metrics.tool_call_count,
+                        model_duration_ms=metrics.model_duration_ms,
+                        search_calls=metrics.search_calls,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                )
                 print(f"⚠️  {step_name}第{attempt}次执行失败: {exc}")
 
-        return StepResult(name=step_name, ok=False, error=last_error)
+        return StepResult(
+            name=step_name,
+            ok=False,
+            error=last_error,
+            attempts=attempts,
+            tool_call_count=total_tool_calls,
+        )
+
+    def _mark_step_postprocess_failure(
+        self,
+        step_result: StepResult,
+        error: Exception,
+    ):
+        """将 JSON 解析、证据对齐或引用校验失败同步到最后一次尝试。"""
+        step_result.ok = False
+        step_result.error = error
+        if not step_result.attempts:
+            return
+        last_attempt = step_result.attempts[-1]
+        last_attempt.status = "failed"
+        last_attempt.error_type = type(error).__name__
+        last_attempt.error_message = str(error)
 
     def _run_agent_with_timeout(
         self,
@@ -1138,21 +2118,52 @@ class MultiAgentShoppingAdvisor:
         query: str,
         timeout_seconds: int,
         uses_tools: bool,
-    ) -> str:
-        """在线程池中执行 Agent.run,并统一映射错误类型"""
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(agent.run, query)
+    ) -> AgentRunResult:
+        """执行 Agent,检索 Agent 使用可取消异步超时,普通模型保留线程隔离。"""
+        if uses_tools and hasattr(agent, "run_with_timeout"):
             try:
-                response = future.result(timeout=timeout_seconds)
-            except FuturesTimeoutError as exc:
-                future.cancel()
-                error_cls = ToolTimeoutError if uses_tools else ModelTimeoutError
-                raise error_cls(step_name, f"{step_name}超过{timeout_seconds}秒未完成") from exc
+                return agent.run_with_timeout(query, timeout_seconds)
+            except SearchPipelineTimeoutError as exc:
+                raise ToolTimeoutError(
+                    step_name,
+                    f"{step_name}超过{timeout_seconds}秒未完成",
+                    metrics=exc.metrics,
+                ) from exc
             except Exception as exc:
-                classified_error = self._classify_runtime_error(step_name, exc, uses_tools)
+                classified_error = self._classify_runtime_error(
+                    step_name,
+                    exc,
+                    uses_tools,
+                )
+                classified_error.metrics = getattr(
+                    exc,
+                    "metrics",
+                    AgentRunMetrics(),
+                )
                 raise classified_error from exc
 
-        return str(response)
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(agent.run, query)
+        try:
+            response = future.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            future.cancel()
+            error_cls = ToolTimeoutError if uses_tools else ModelTimeoutError
+            raise error_cls(
+                step_name,
+                f"{step_name}超过{timeout_seconds}秒未完成",
+            ) from exc
+        except Exception as exc:
+            classified_error = self._classify_runtime_error(
+                step_name,
+                exc,
+                uses_tools,
+            )
+            raise classified_error from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        return AgentRunResult(response=str(response))
 
     def _classify_runtime_error(self, step_name: str, error: Exception, uses_tools: bool) -> StepExecutionError:
         """根据异常文本粗分类为工具异常或模型异常"""
@@ -1211,6 +2222,7 @@ class MultiAgentShoppingAdvisor:
         request: ShoppingRequest,
         candidates: List[CandidateProduct],
         step_results: Dict[str, StepResult],
+        evidence: Optional[List[EvidenceItem]] = None,
     ) -> ShoppingReport:
         """在部分步骤成功时,返回可恢复的部分成功报告"""
         successful_steps = [
@@ -1270,6 +2282,8 @@ class MultiAgentShoppingAdvisor:
             final_recommendation=final_recommendation,
             budget_advice="部分步骤失败,预算建议仅供参考,请重试后确认实时价格",
             general_tips=general_tips,
+            evidence=evidence or [],
+            citation_warnings=["报告生成或引用校验失败,当前为降级结果"],
         )
 
     def _create_fallback_report(self, request: ShoppingRequest) -> ShoppingReport:

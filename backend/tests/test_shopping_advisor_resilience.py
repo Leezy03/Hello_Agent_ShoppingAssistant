@@ -1,10 +1,15 @@
 from app.agents.shopping_advisor_agent import JsonRepairError, ModelTimeoutError, ToolTimeoutError
 
-from tests.helpers import StubAgent, build_report_json
+from tests.helpers import StubAgent, build_evidence_json, build_report_json
 
 
 def test_retry_succeeds_on_second_attempt(advisor_factory, shopping_request):
-    advisor = advisor_factory(review_responses=[RuntimeError("mcp tool unavailable"), "测评成功"])
+    advisor = advisor_factory(
+        review_responses=[
+            RuntimeError("mcp tool unavailable"),
+            build_evidence_json("review"),
+        ]
+    )
 
     report = advisor.analyze_product(shopping_request)
 
@@ -77,3 +82,21 @@ def test_json_repair_pass_raises_error_when_repair_fails(advisor_factory):
         assert isinstance(exc, JsonRepairError)
     else:
         raise AssertionError("Expected JsonRepairError to be raised")
+
+
+def test_postprocess_failure_updates_last_attempt_trace(advisor_factory):
+    advisor = advisor_factory()
+    step_result = advisor._execute_agent_step(
+        step_name="测评搜集",
+        agent=advisor.review_agent,
+        query="测评查询",
+        timeout_seconds=1,
+        retries=0,
+        uses_tools=True,
+    )
+
+    advisor._mark_step_postprocess_failure(step_result, ValueError("证据产品对齐失败"))
+
+    assert step_result.ok is False
+    assert step_result.attempts[-1].status == "failed"
+    assert step_result.attempts[-1].error_type == "ValueError"

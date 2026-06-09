@@ -1,12 +1,17 @@
 from evals.shopping_eval import evaluate_report, load_cases
-from tests.helpers import build_report_json
+from tests.helpers import build_evidence_json, build_report_json
 
-from app.models.schemas import ShoppingReport
+from app.models.schemas import EvidenceCollectionResult, ShoppingReport
 
 
 def _report_from_json(response: str) -> ShoppingReport:
     json_text = response.split("```json\n", 1)[1].rsplit("\n```", 1)[0]
-    return ShoppingReport.model_validate_json(json_text)
+    report = ShoppingReport.model_validate_json(json_text)
+    for evidence_type in ["review", "price", "risk"]:
+        evidence_response = build_evidence_json(evidence_type)
+        evidence_json = evidence_response.split("```json\n", 1)[1].rsplit("\n```", 1)[0]
+        report.evidence.extend(EvidenceCollectionResult.model_validate_json(evidence_json).evidence)
+    return report
 
 
 def test_eval_cases_are_valid():

@@ -14,6 +14,8 @@
 - 执行拓扑为：候选抽取 -> LangGraph fan-out 并行执行测评/价格/避雷检索 -> fan-in 汇总生成报告
 - 检索阶段使用 Brave Search MCP Server，通过 LangChain MCP adapters 接入搜索能力
 - 报告输出包含：候选产品、测评来源、优缺点、避雷点、争议点、预算建议、最终建议
+- 测评、价格、风险三个检索节点统一输出 EvidenceItem，报告结论通过 evidence_ids 关联来源
+- Python 引用校验器检查证据ID、证据类型、候选型号归因和跨产品引用
 - 支持可恢复异常处理：步骤级失败、重试、超时分类、JSON repair pass、部分成功汇总
 - 支持后台任务状态与节点级 Trace：返回 task_id，记录每个 Agent 节点的状态、耗时和错误信息
 - 前端支持结果页展示与导出图片/PDF
@@ -141,6 +143,7 @@ npm run dev
 - 购物分析工作流的成功路径、候选 fallback、检索阶段并行执行
 - 重试、工具超时、模型超时、JSON repair pass、部分成功返回等可恢复异常链路
 - 后台任务状态查询、节点级 Trace 写入与读取
+- EvidenceItem 结构化解析、引用ID有效性、证据类型和跨产品引用校验
 - 评测集可解析性、报告结构完整度和关键词覆盖评分逻辑
 
 运行方式：
@@ -167,6 +170,7 @@ pytest
 - 品类关键词、用户关注点和风险关键词覆盖情况
 - 核心章节是否完整：横向对比、最终建议、优缺点、避雷点、通用建议
 - verdict 是否落在推荐/不推荐/看需求/待定等受控结论范围内
+- evidence catalog 与 evidence_ids 是否存在、引用是否有效
 - 是否出现“建议自行搜索”“无法访问互联网”等禁用表达
 
 只校验评测集格式：
@@ -277,11 +281,32 @@ TASK_STATE_TTL_SECONDS=86400
 - controversy_points：争议点
 - verdict：推荐、不推荐、看需求
 - verdict_reason：结论理由
+- price_evidence_ids / spec_evidence_ids：价格和规格来源
+- pro_evidence_ids / con_evidence_ids：优缺点到证据ID的映射
+- red_flag_evidence_ids / controversy_evidence_ids：风险和争议到证据ID的映射
+- verdict_evidence_ids：支持产品结论的证据ID
+
+报告还包含：
+
+- evidence：完整证据目录，每条 EvidenceItem 包含产品、类型、URL、标题、平台、作者、原始摘要、claims 和检索时间
+- comparison_evidence_ids：支持横向对比的证据
+- recommendation_evidence_ids：支持最终建议的证据
+- budget_evidence_ids：支持预算建议的价格证据
+- citation_warnings：字段缺少引用时的非阻断警告
+
+Python 引用一致性校验会阻止：
+
+- 引用不存在的 evidence_id
+- 价格字段引用非 price 类型证据
+- 报告引用候选列表之外的产品
+- A 型号引用 B 型号的证据
+- 证据映射中的结论文本与报告正文不一致
 
 ## 已知实现特点
 
 - 候选产品抽取先于所有检索步骤，目的是减少 A 型号测评与 B 型号价格串台的问题
 - 三个检索 Agent 通过 LangGraph 原生 fan-out/fan-in 工作流编排，并使用独立的 Brave Search MCP 调用链路
+- 三路检索结果不再以自由文本直接传给报告节点，而是先解析并标准化为 EvidenceItem
 - 报告生成阶段依赖上游检索结果；如果上游部分失败，会显式说明证据边界
 - 后台任务状态支持 memory 与 Redis 两种存储；Redis 模式用于多 worker/多实例共享 task_id、进度、报告和节点 Trace
 
