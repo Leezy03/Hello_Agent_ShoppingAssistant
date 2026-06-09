@@ -35,6 +35,9 @@
             <a-menu-item v-if="traceEvents.length > 0" key="trace">
               <span>🧭 执行Trace</span>
             </a-menu-item>
+            <a-menu-item v-if="report.evidence && report.evidence.length > 0" key="evidence">
+              <span>🔗 证据目录</span>
+            </a-menu-item>
             <a-sub-menu key="products" title="📦 产品分析">
               <a-menu-item v-for="(p, i) in report.products" :key="`product-${i}`">
                 {{ p.product.name }}
@@ -76,7 +79,7 @@
         <!-- 执行Trace -->
         <a-card id="trace" title="🧭 Agent执行Trace" :bordered="false" class="trace-card" v-if="traceEvents.length > 0">
           <div v-if="taskId" class="task-id-row">任务ID: {{ taskId }}</div>
-          <a-table :data-source="traceEvents" :pagination="false" size="small" bordered row-key="event_id" :scroll="{ x: 760 }">
+          <a-table :data-source="traceEvents" :pagination="false" size="small" bordered row-key="event_id" :scroll="{ x: 980 }">
             <a-table-column title="状态" key="status" :width="90">
               <template #default="{ record }">
                 <a-tag :color="getTraceStatusColor(record.status)">
@@ -90,11 +93,122 @@
                 {{ formatDuration(record.duration_ms) }}
               </template>
             </a-table-column>
+            <a-table-column title="尝试" data-index="attempt_count" key="attempt_count" :width="70" />
+            <a-table-column title="工具调用" data-index="tool_call_count" key="tool_call_count" :width="90" />
             <a-table-column title="说明" data-index="message" key="message" />
             <a-table-column title="错误" key="error" :width="180">
               <template #default="{ record }">
                 <span v-if="record.error_type">{{ record.error_type }}: {{ record.error_message }}</span>
                 <span v-else>-</span>
+              </template>
+            </a-table-column>
+            <template #expandedRowRender="{ record }">
+              <div v-if="record.attempts && record.attempts.length > 0" class="trace-attempts">
+                <section
+                  v-for="attempt in record.attempts"
+                  :key="`${record.event_id}-${attempt.attempt}`"
+                  class="trace-attempt"
+                >
+                  <div class="trace-attempt-summary">
+                    <a-tag :color="getTraceStatusColor(attempt.status)">
+                      第{{ attempt.attempt }}次 {{ getTraceStatusText(attempt.status) }}
+                    </a-tag>
+                    <span>总耗时 {{ formatDuration(attempt.duration_ms) }}</span>
+                    <span>工具调用 {{ attempt.tool_call_count }}</span>
+                    <span v-if="attempt.model_duration_ms !== undefined && attempt.model_duration_ms !== null">
+                      模型耗时 {{ formatDuration(attempt.model_duration_ms) }}
+                    </span>
+                    <span v-if="attempt.error_type" class="trace-attempt-error">
+                      {{ attempt.error_type }}: {{ attempt.error_message }}
+                    </span>
+                  </div>
+                  <a-table
+                    v-if="attempt.search_calls && attempt.search_calls.length > 0"
+                    :data-source="attempt.search_calls"
+                    :pagination="false"
+                    size="small"
+                    row-key="query"
+                  >
+                    <a-table-column title="搜索词" data-index="query" key="query" />
+                    <a-table-column title="状态" key="status" :width="90">
+                      <template #default="{ record: searchCall }">
+                        <a-tag :color="getTraceStatusColor(searchCall.status)">
+                          {{ getTraceStatusText(searchCall.status) }}
+                        </a-tag>
+                      </template>
+                    </a-table-column>
+                    <a-table-column title="耗时" key="duration" :width="90">
+                      <template #default="{ record: searchCall }">
+                        {{ formatDuration(searchCall.duration_ms) }}
+                      </template>
+                    </a-table-column>
+                    <a-table-column title="结果字符" data-index="result_chars" key="result_chars" :width="90" />
+                    <a-table-column title="错误" key="search_error" :width="220">
+                      <template #default="{ record: searchCall }">
+                        <span v-if="searchCall.error_type">
+                          {{ searchCall.error_type }}: {{ searchCall.error_message }}
+                        </span>
+                        <span v-else>-</span>
+                      </template>
+                    </a-table-column>
+                  </a-table>
+                </section>
+              </div>
+            </template>
+          </a-table>
+        </a-card>
+
+        <!-- 证据目录 -->
+        <a-card
+          id="evidence"
+          title="🔗 检索证据目录"
+          :bordered="false"
+          class="evidence-card"
+          v-if="report.evidence && report.evidence.length > 0"
+        >
+          <a-alert
+            v-for="warning in report.citation_warnings || []"
+            :key="warning"
+            :message="warning"
+            type="warning"
+            show-icon
+            class="citation-warning"
+          />
+          <a-table
+            :data-source="report.evidence"
+            :pagination="{ pageSize: 8 }"
+            size="small"
+            bordered
+            row-key="evidence_id"
+            :scroll="{ x: 980 }"
+          >
+            <a-table-column title="证据ID" data-index="evidence_id" key="evidence_id" :width="110" />
+            <a-table-column title="类型" key="evidence_type" :width="80">
+              <template #default="{ record }">
+                <a-tag :color="getEvidenceTypeColor(record.evidence_type)">
+                  {{ getEvidenceTypeText(record.evidence_type) }}
+                </a-tag>
+              </template>
+            </a-table-column>
+            <a-table-column title="产品" data-index="product_name" key="product_name" :width="170" />
+            <a-table-column title="来源" key="source" :width="220">
+              <template #default="{ record }">
+                <a
+                  v-if="record.source_url"
+                  :href="record.source_url"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {{ record.source_title || record.platform || record.source_url }}
+                </a>
+                <span v-else>{{ record.source_title || record.platform || '来源链接缺失' }}</span>
+              </template>
+            </a-table-column>
+            <a-table-column title="平台" data-index="platform" key="platform" :width="100" />
+            <a-table-column title="证据摘要" key="snippet">
+              <template #default="{ record }">
+                <div class="evidence-snippet">{{ record.snippet || '信息不足' }}</div>
+                <div v-for="claim in record.claims" :key="claim" class="evidence-claim">• {{ claim }}</div>
               </template>
             </a-table-column>
           </a-table>
@@ -332,6 +446,8 @@ const getTraceStatusColor = (status: string): string => {
   if (status === 'success') return 'green'
   if (status === 'failed') return 'red'
   if (status === 'partial') return 'orange'
+  if (status === 'empty') return 'orange'
+  if (status === 'cancelled') return 'orange'
   return 'blue'
 }
 
@@ -340,6 +456,9 @@ const getTraceStatusText = (status: string): string => {
   if (status === 'success') return '成功'
   if (status === 'partial') return '降级'
   if (status === 'failed') return '失败'
+  if (status === 'empty') return '无结果'
+  if (status === 'cancelled') return '已取消'
+  if (status === 'pending') return '等待中'
   return status
 }
 
@@ -347,6 +466,20 @@ const formatDuration = (durationMs?: number): string => {
   if (durationMs === undefined || durationMs === null) return '-'
   if (durationMs < 1000) return `${durationMs}ms`
   return `${(durationMs / 1000).toFixed(1)}s`
+}
+
+const getEvidenceTypeColor = (type: string): string => {
+  if (type === 'review') return 'blue'
+  if (type === 'price') return 'green'
+  if (type === 'risk') return 'red'
+  return 'default'
+}
+
+const getEvidenceTypeText = (type: string): string => {
+  if (type === 'review') return '测评'
+  if (type === 'price') return '价格'
+  if (type === 'risk') return '风险'
+  return type
 }
 
 // 导出为图片
@@ -521,6 +654,53 @@ const exportAsPDF = async () => {
 
 .trace-card {
   margin-bottom: 20px;
+}
+
+.trace-attempts {
+  display: grid;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.trace-attempt {
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.trace-attempt-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  align-items: center;
+  padding: 10px 12px;
+  background: #fafafa;
+  color: #555;
+  font-size: 13px;
+}
+
+.trace-attempt-error {
+  color: #cf1322;
+}
+
+.evidence-card {
+  margin-bottom: 20px;
+}
+
+.citation-warning {
+  margin-bottom: 10px;
+}
+
+.evidence-snippet {
+  color: #333;
+  line-height: 1.6;
+}
+
+.evidence-claim {
+  margin-top: 4px;
+  color: #666;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .task-id-row {

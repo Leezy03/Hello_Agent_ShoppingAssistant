@@ -1,5 +1,19 @@
 // 类型定义 - 避雷购物助手
 
+export interface EvidenceItem {
+  evidence_id: string
+  product_name: string
+  evidence_type: 'review' | 'price' | 'risk'
+  source_url?: string
+  source_title: string
+  platform: string
+  author?: string
+  snippet: string
+  claims: string[]
+  search_query?: string
+  retrieved_at: string
+}
+
 export interface ReviewSource {
   platform: string
   author: string
@@ -9,6 +23,7 @@ export interface ReviewSource {
   is_sponsored: boolean
   key_points: string[]
   credibility_score: number
+  evidence_ids: string[]
 }
 
 export interface Product {
@@ -19,6 +34,8 @@ export interface Product {
   rating?: number
   image_url?: string
   specs?: Record<string, any>
+  price_evidence_ids: string[]
+  spec_evidence_ids: string[]
 }
 
 export interface ProductAnalysis {
@@ -30,6 +47,11 @@ export interface ProductAnalysis {
   controversy_points: string[]
   verdict: string
   verdict_reason: string
+  pro_evidence_ids: Record<string, string[]>
+  con_evidence_ids: Record<string, string[]>
+  red_flag_evidence_ids: Record<string, string[]>
+  controversy_evidence_ids: Record<string, string[]>
+  verdict_evidence_ids: string[]
 }
 
 export interface ShoppingReport {
@@ -40,6 +62,11 @@ export interface ShoppingReport {
   final_recommendation: string
   budget_advice?: string
   general_tips: string[]
+  comparison_evidence_ids: string[]
+  recommendation_evidence_ids: string[]
+  budget_evidence_ids: string[]
+  evidence: EvidenceItem[]
+  citation_warnings: string[]
 }
 
 export interface ShoppingFormData {
@@ -67,6 +94,29 @@ export interface TaskTraceEvent {
   started_at: string
   ended_at?: string
   duration_ms?: number
+  attempt_count: number
+  tool_call_count: number
+  attempts: StepAttemptTrace[]
+  error_type?: string
+  error_message?: string
+}
+
+export interface SearchCallTrace {
+  query: string
+  status: 'pending' | 'running' | 'success' | 'empty' | 'failed' | 'cancelled' | string
+  duration_ms?: number
+  result_chars: number
+  error_type?: string
+  error_message?: string
+}
+
+export interface StepAttemptTrace {
+  attempt: number
+  status: 'success' | 'failed' | string
+  duration_ms: number
+  tool_call_count: number
+  model_duration_ms?: number
+  search_calls: SearchCallTrace[]
   error_type?: string
   error_message?: string
 }

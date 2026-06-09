@@ -210,6 +210,12 @@
                 <span class="trace-name">{{ event.step_name }}</span>
                 <span v-if="event.duration_ms !== undefined && event.duration_ms !== null" class="trace-duration">
                   {{ formatDuration(event.duration_ms) }}
+                  <template v-if="event.attempt_count">
+                    · {{ event.attempt_count }}次
+                  </template>
+                  <template v-if="event.tool_call_count">
+                    · {{ event.tool_call_count }}检索
+                  </template>
                 </span>
                 <span class="trace-message">{{ event.message }}</span>
               </div>
