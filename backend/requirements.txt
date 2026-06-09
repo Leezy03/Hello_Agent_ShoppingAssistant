@@ -23,6 +23,9 @@ python-multipart>=0.0.9
 # 日志
 loguru>=0.7.0
 
+# 任务状态持久化
+redis>=5.0.0
+
 # MCP相关
 fastmcp>=2.0.0
 uv>=0.8.0

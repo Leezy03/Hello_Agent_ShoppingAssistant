@@ -209,10 +209,28 @@ npm run build
 - APP_DEBUG：是否启用调试模式
 - LOG_LEVEL：日志级别
 - CORS_ORIGINS：允许跨域的前端地址，多个值用逗号分隔
+- TASK_STORE_BACKEND：任务状态存储后端，memory 或 redis
+- REDIS_URL：Redis 连接地址，例如 redis://localhost:6379/0
+- TASK_STATE_TTL_SECONDS：任务状态过期时间，默认 86400 秒
 
 说明：
 - 代码中的配置项名是 search_api_key，但环境变量实际读取的是 SEARCH_API_KEY
 - LLM 侧会优先读取 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL_ID，也兼容 OPENAI_API_KEY、OPENAI_BASE_URL、OPENAI_MODEL 形式
+- TASK_STORE_BACKEND=memory 适合本地开发；TASK_STORE_BACKEND=redis 适合多 worker 或多实例部署，任务状态、报告和节点 Trace 会写入 Redis 并按 TTL 自动过期
+
+本地 Redis 示例：
+
+```powershell
+docker run --name shopping-redis -p 6379:6379 -d redis:7
+```
+
+然后在 backend/.env 中设置：
+
+```text
+TASK_STORE_BACKEND=redis
+REDIS_URL=redis://localhost:6379/0
+TASK_STATE_TTL_SECONDS=86400
+```
 
 前端变量见 frontend/.env.example：
 
@@ -265,7 +283,7 @@ npm run build
 - 候选产品抽取先于所有检索步骤，目的是减少 A 型号测评与 B 型号价格串台的问题
 - 三个检索 Agent 通过 LangGraph 原生 fan-out/fan-in 工作流编排，并使用独立的 Brave Search MCP 调用链路
 - 报告生成阶段依赖上游检索结果；如果上游部分失败，会显式说明证据边界
-- 后台任务状态当前使用进程内内存存储，适合本地演示；多实例生产部署可替换为 Redis/Postgres 持久化任务表
+- 后台任务状态支持 memory 与 Redis 两种存储；Redis 模式用于多 worker/多实例共享 task_id、进度、报告和节点 Trace
 
 ## 安全说明
 

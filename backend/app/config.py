@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # 日志配置
     log_level: str = "INFO"
 
+    # 任务状态存储配置
+    # memory: 本地开发/测试; redis: 多worker/多实例生产部署
+    task_store_backend: str = "memory"
+    redis_url: str = "redis://localhost:6379/0"
+    task_state_ttl_seconds: int = 86400
+
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -105,3 +111,7 @@ def print_config():
     print(f"LLM Base URL: {llm_base_url}")
     print(f"LLM Model: {llm_model}")
     print(f"日志级别: {settings.log_level}")
+    print(f"任务状态存储: {settings.task_store_backend}")
+    if settings.task_store_backend.lower() == "redis":
+        print(f"Redis URL: {'已配置' if settings.redis_url else '未配置'}")
+        print(f"任务状态TTL: {settings.task_state_ttl_seconds}秒")
